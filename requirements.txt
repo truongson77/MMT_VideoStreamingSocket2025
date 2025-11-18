@@ -1,0 +1,4 @@
+pillow==11.3.0
+
+# System dependency:
+# Tcl/Tk 8.6.x required (check via: python3 -m tkinter)
