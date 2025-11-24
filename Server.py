@@ -18,8 +18,13 @@ class Server:
 			clientInfo = {}
 			clientInfo['rtspSocket'] = rtspSocket.accept()
 			ServerWorker(clientInfo).run()		
+		
+   
+   
 
 if __name__ == "__main__":
 	(Server()).main()
+ 
+ 
 
 
