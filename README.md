@@ -22,3 +22,12 @@ RTP de-packetization in the client, and takes care of displaying the transmitted
 
 ```bash
 python -m venv venv
+
+## Run Project
+- Server.py
+```bash
+python3 Server.py 8554  
+
+- ClientLauncher.py
+```bash
+python3 ClientLauncher.py localhost 8554 25000 movie.Mjpeg
