@@ -117,6 +117,8 @@ class ServerWorker:
                 continue
 
             frameNumber = self.clientInfo['videoStream'].frameNbr()
+            
+
 
             # số mảnh cần gửi
             total_frag = math.ceil(len(data) / MAX_PAYLOAD)
