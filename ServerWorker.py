@@ -62,7 +62,6 @@ class ServerWorker:
                 self.replyRtsp(self.OK_200, seq[1])
                 
                 self.clientInfo['rtpPort'] = request[2].split(' ')[3]
-        
         elif requestType == self.PLAY:
             if self.state == self.READY:
                 print("processing PLAY\n")
@@ -73,7 +72,7 @@ class ServerWorker:
                 self.replyRtsp(self.OK_200, seq[1])
                 
                 self.clientInfo['event'] = threading.Event()
-                self.clientInfo['worker']= threading.Thread(target=self.sendRtp) 
+                self.clientInfo['worker'] = threading.Thread(target=self.sendRtp) 
                 self.clientInfo['worker'].start()
         
         elif requestType == self.PAUSE:
@@ -94,17 +93,13 @@ class ServerWorker:
             
             self.clientInfo['rtpSocket'].close()
             
-    # -------------------------------------------------------------------
-    #  SEND RTP — VERSION WITH FRAGMENTATION SUPPORT
-    # -------------------------------------------------------------------
     def sendRtp(self):
         """Send RTP packets over UDP (supports fragmentation)."""
 
-        # sequence number cho từng packet, không reset theo frame
         if not hasattr(self, "seqNum"):
             self.seqNum = 0
 
-        MAX_PAYLOAD = 1400   # giới hạn payload trong mỗi gói RTP
+        MAX_PAYLOAD = 1400
 
         while True:
             self.clientInfo['event'].wait(0.05) 
@@ -120,7 +115,6 @@ class ServerWorker:
             
 
 
-            # số mảnh cần gửi
             total_frag = math.ceil(len(data) / MAX_PAYLOAD)
 
             for frag_idx in range(total_frag):
@@ -128,7 +122,6 @@ class ServerWorker:
                 end = min((frag_idx + 1) * MAX_PAYLOAD, len(data))
                 payload = data[start:end]
 
-                # marker = 1 nếu là mảnh cuối
                 marker = 1 if frag_idx == total_frag - 1 else 0
 
                 try:
@@ -149,18 +142,17 @@ class ServerWorker:
             if self.clientInfo['event'].isSet():
                 break
 
-    # sửa makeRtp để nhận seqnum + marker
+
     def makeRtp(self, payload, seqnum, marker):
         """RTP-packetize the video data."""
         version = 2
         padding = 0
         extension = 0
         cc = 0
-        pt = 26 # MJPEG type
+        pt = 26 
         ssrc = 0 
         
         rtpPacket = RtpPacket()
-        
         rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
         
         return rtpPacket.getPacket()
