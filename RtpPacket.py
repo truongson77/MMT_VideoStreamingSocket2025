@@ -17,7 +17,7 @@ class RtpPacket:
         self.header[0] = (version << 6) | (padding << 5) | (extension << 4) | (cc & 0x0F)
 
         # Byte 1: M (1 bit), PT (7 bits)
-        # marker nằm ở bit 7 (MSB)
+        # marker náº±m á»Ÿ bit 7 (MSB)
         self.header[1] = ((marker & 0x01) << 7) | (pt & 0x7F)
 
         # Bytes 2-3: Sequence Number
@@ -66,7 +66,6 @@ class RtpPacket:
 
     def getMarker(self):
         """Return marker bit (0 or 1)."""
-        # marker chính là bit 7 của header[1]
         return (self.header[1] >> 7) & 0x01
 
     def getPayload(self):
