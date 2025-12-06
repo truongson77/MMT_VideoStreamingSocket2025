@@ -22,6 +22,7 @@ RTP de-packetization in the client, and takes care of displaying the transmitted
 
 ```bash
 python -m venv venv
+pip install -r  requirements.txt
 
 ## Run Project
 - Server.py
