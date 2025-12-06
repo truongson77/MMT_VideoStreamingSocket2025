@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 from random import randint
 import sys, traceback, threading, socket
-from time import time  # dùng hàm time()
+from time import time
 
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
@@ -126,7 +127,7 @@ class ServerWorker:
         self.firstSendTime = time()
 
         while True:
-            # 0.05s ~ 20 fps (tuỳ video)
+            # 0.05s ~ 20 fps (tùy video)
             self.clientInfo['event'].wait(0.05)
 
             # Nếu PAUSE / TEARDOWN thì dừng

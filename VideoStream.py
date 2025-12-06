@@ -24,7 +24,7 @@ class VideoStream:
             return None  # Hết video
 
         # JPEG quality cao cho HD
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 100]
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 98]
         success, jpeg = cv2.imencode(".jpg", frame, encode_param)
         if not success:
             return None

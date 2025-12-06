@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 from time import time
 
@@ -66,6 +67,7 @@ class RtpPacket:
 
     def getMarker(self):
         """Return marker bit (0 or 1)."""
+        # marker chính là bit 7 của header[1]
         return (self.header[1] >> 7) & 0x01
 
     def getPayload(self):

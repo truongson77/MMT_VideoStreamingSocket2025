@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from tkinter import *
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
@@ -28,7 +29,7 @@ class Client:
 
     def __init__(self, master, serveraddr, serverport, rtpport, filename):
         
-        self.savedFrameCount = 0  # ← THÊM DÒNG NÀY
+        self.savedFrameCount = 0
         self.MAX_SAVE_FRAMES = 5 
         
         self.master = master
@@ -65,6 +66,9 @@ class Client:
         self.frameBuffer = bytearray()
         self.frameCache = deque(maxlen=BUFFER_SIZE)
         self.buffering = False
+        
+        # Flag để track trạng thái streaming
+        self.streamEnded = False
 
     # -----------------------------------------------------
     # GUI SETUP
@@ -107,20 +111,30 @@ class Client:
             self.sendRtspRequest(self.SETUP)
 
     def exitClient(self):
+        # In stats TRƯỚC khi teardown
+        if self.state == self.PLAYING or self.receivedPackets > 0:
+            self.print_stats()
         self.sendRtspRequest(self.TEARDOWN)
+        # Đợi một chút để đảm bảo TEARDOWN được gửi
+        time.sleep(0.1)
         self.master.destroy()
 
     def pauseMovie(self):
         if self.state == self.PLAYING:
             self.sendRtspRequest(self.PAUSE)
-            self.print_stats()  
+            # Đợi một chút để đảm bảo stats được in đầy đủ
+            time.sleep(0.1)
+            self.print_stats()
 
     def playMovie(self):
         if self.state == self.READY:
-            print("[CLIENT] PLAY clicked — buffering...")
+            print("[CLIENT] PLAY clicked – buffering...")
+
+            # Reset flag nếu replay
+            self.streamEnded = False
 
             # bắt đầu thread nhận RTP
-            threading.Thread(target=self.listenRtp).start()
+            threading.Thread(target=self.listenRtp, daemon=True).start()
 
             self.playEvent = threading.Event()
             self.playEvent.clear()
@@ -138,18 +152,20 @@ class Client:
     def waitForBuffer(self):
         # chờ frame đầu tiên
         while len(self.frameCache) == 0:
-            if self.state != self.PLAYING:
+            if self.state != self.PLAYING or self.streamEnded:
                 return
 
         # đợi tới khi đủ MIN_BUFFER frame
         while len(self.frameCache) < MIN_BUFFER and self.state == self.PLAYING:
-            pass
+            if self.streamEnded:
+                break
 
         # bắt đầu play từ cache
         threading.Thread(target=self.playFromCache, daemon=True).start()
 
     def playFromCache(self):
         cacheFile = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+        FRAME_INTERVAL = 0.05  # 20 fps = 0.05s per frame
 
         while len(self.frameCache) > 0 and self.state == self.PLAYING:
             frameData = self.frameCache.popleft()
@@ -161,14 +177,23 @@ class Client:
                 photo = ImageTk.PhotoImage(Image.open(cacheFile))
                 self.label.configure(image=photo)
                 self.label.image = photo
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ERROR] Failed to display frame: {e}")
+            
+            # THÊM DELAY để đồng bộ với server frame rate
+            time.sleep(FRAME_INTERVAL)
+        
+        # Khi cache hết và stream đã kết thúc
+        if self.streamEnded and len(self.frameCache) == 0:
+            print("[CLIENT] Video playback completed")
 
     # -----------------------------------------------------
     # RTP RECEIVING + FRAME ASSEMBLY
     # -----------------------------------------------------
 
     def listenRtp(self):
+        print("[CLIENT] Starting RTP listener...")
+        
         while True:
             try:
                 data = self.rtpSocket.recv(65536)
@@ -225,64 +250,104 @@ class Client:
                     if self.buffering and len(self.frameCache) < BUFFER_SIZE:
                         with open(imageFile, "rb") as f:
                             self.frameCache.append(f.read())
-                            print(f"[CACHE] Stored frame — {len(self.frameCache)}")
+                            print(f"[CACHE] Stored frame – {len(self.frameCache)}")
 
                     # LIVE UPDATE (khi cache tiêu hết)
                     self.updateMovie(imageFile)
                     self.frameBuffer = bytearray()
 
-            except Exception:
+            except socket.timeout:
+                # Timeout bình thường, tiếp tục loop
+                if self.state != self.PLAYING:
+                    break
+                continue
+                
+            except OSError as e:
+                # Socket đã đóng hoặc lỗi mạng
+                print(f"[ERROR] Socket error: {e}")
+                break
+                
+            except Exception as e:
+                print(f"[ERROR] Unexpected error in listenRtp: {e}")
+                traceback.print_exc()
+                
+                # Kiểm tra các điều kiện dừng
                 if hasattr(self, "playEvent") and self.playEvent.isSet():
+                    print("[CLIENT] Playback paused by user")
                     break
 
                 if self.teardownAcked == 1:
+                    print("[CLIENT] Teardown acknowledged, closing...")
+                    self.streamEnded = True
                     self.print_stats()
                     try:
                         self.rtpSocket.close()
                     except Exception:
                         pass
                     break
+                
+                # Nếu không phải PAUSE/TEARDOWN, có thể là video kết thúc
+                if self.state == self.PLAYING:
+                    print("[CLIENT] Stream ended unexpectedly")
+                    self.streamEnded = True
+                    self.print_stats()
+                    break
+
+        print("[CLIENT] RTP listener stopped")
 
     # -----------------------------------------------------
 
     def writeFrame(self, data):
         filepath = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-        with open(filepath, "wb") as f:
-            f.write(data)
-                # ===== THÊM: Lưu thêm một số frame để so sánh =====
-        if self.savedFrameCount < self.MAX_SAVE_FRAMES:
-            frame_num = self.receivedFrames
-            compare_path = f"streamed_frames/frame_{frame_num:04d}.jpg"
-            
-            # Tạo thư mục nếu chưa có
-            os.makedirs("streamed_frames", exist_ok=True)
-            
-            with open(compare_path, "wb") as f:
+        
+        try:
+            with open(filepath, "wb") as f:
                 f.write(data)
-            
-            self.savedFrameCount += 1
-            print(f"[SAVE] Saved for comparison: {compare_path}")
-        # ==================================================
+                
+            # ===== Lưu thêm một số frame để so sánh =====
+            if self.savedFrameCount < self.MAX_SAVE_FRAMES:
+                frame_num = self.receivedFrames
+                compare_path = f"streamed_frames/frame_{frame_num:04d}.jpg"
+                
+                # Tạo thư mục nếu chưa có
+                os.makedirs("streamed_frames", exist_ok=True)
+                
+                with open(compare_path, "wb") as f:
+                    f.write(data)
+                
+                self.savedFrameCount += 1
+                print(f"[SAVE] Saved for comparison: {compare_path}")
+            # ==================================================
+        except Exception as e:
+            print(f"[ERROR] Failed to write frame: {e}")
         
         return filepath
     
 
     def updateMovie(self, imageFile):
-        photo = ImageTk.PhotoImage(Image.open(imageFile))
-        self.label.configure(image=photo, height=288)
-        self.label.image = photo
+        try:
+            photo = ImageTk.PhotoImage(Image.open(imageFile))
+            self.label.configure(image=photo, height=288)
+            self.label.image = photo
+        except Exception as e:
+            print(f"[ERROR] Failed to update display: {e}")
 
     # -----------------------------------------------------
     # RTSP  
     # -----------------------------------------------------
 
     def connectToServer(self):
-        self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.rtspSocket.connect((self.serverAddr, self.serverPort))
+        try:
+            self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.rtspSocket.connect((self.serverAddr, self.serverPort))
+            print(f"[CLIENT] Connected to server {self.serverAddr}:{self.serverPort}")
+        except Exception as e:
+            print(f"[ERROR] Failed to connect to server: {e}")
+            sys.exit(1)
 
     def sendRtspRequest(self, requestCode):
         if requestCode == self.SETUP and self.state == self.INIT:
-            threading.Thread(target=self.recvRtspReply).start()
+            threading.Thread(target=self.recvRtspReply, daemon=True).start()
             self.rtspSeq += 1
             request = (
                 f"SETUP {self.fileName} RTSP/1.0\n"
@@ -321,56 +386,75 @@ class Client:
         else:
             return
 
-        self.rtspSocket.send(request.encode())
-        print("\nData sent:\n" + request)
+        try:
+            self.rtspSocket.send(request.encode())
+            print("\nData sent:\n" + request)
+        except Exception as e:
+            print(f"[ERROR] Failed to send RTSP request: {e}")
 
     # -----------------------------------------------------
 
     def recvRtspReply(self):
         while True:
-            reply = self.rtspSocket.recv(1024)
-            if reply:
-                self.parseRtspReply(reply.decode("utf-8"))
+            try:
+                reply = self.rtspSocket.recv(1024)
+                if reply:
+                    self.parseRtspReply(reply.decode("utf-8"))
 
-            if self.requestSent == self.TEARDOWN:
-                self.rtspSocket.close()
+                if self.requestSent == self.TEARDOWN:
+                    self.rtspSocket.close()
+                    break
+            except Exception as e:
+                print(f"[ERROR] Failed to receive RTSP reply: {e}")
                 break
 
     # -----------------------------------------------------
 
     def parseRtspReply(self, data):
-        lines = data.split('\n')
-        seqNum = int(lines[1].split(' ')[1])
+        try:
+            lines = data.split('\n')
+            seqNum = int(lines[1].split(' ')[1])
 
-        if seqNum == self.rtspSeq:
-            session = int(lines[2].split(' ')[1])
+            if seqNum == self.rtspSeq:
+                session = int(lines[2].split(' ')[1])
 
-            if self.sessionId == 0:
-                self.sessionId = session
+                if self.sessionId == 0:
+                    self.sessionId = session
 
-            if self.sessionId == session and int(lines[0].split(' ')[1]) == 200:
+                if self.sessionId == session and int(lines[0].split(' ')[1]) == 200:
 
-                if self.requestSent == self.SETUP:
-                    self.state = self.READY
-                    self.openRtpPort()
+                    if self.requestSent == self.SETUP:
+                        self.state = self.READY
+                        self.openRtpPort()
+                        print("[CLIENT] Setup complete, ready to play")
 
-                elif self.requestSent == self.PLAY:
-                    self.state = self.PLAYING
+                    elif self.requestSent == self.PLAY:
+                        self.state = self.PLAYING
+                        print("[CLIENT] Playing...")
 
-                elif self.requestSent == self.PAUSE:
-                    self.state = self.READY
-                    self.playEvent.set()
+                    elif self.requestSent == self.PAUSE:
+                        self.state = self.READY
+                        self.playEvent.set()
+                        print("[CLIENT] Paused")
 
-                elif self.requestSent == self.TEARDOWN:
-                    self.state = self.INIT
-                    self.teardownAcked = 1
+                    elif self.requestSent == self.TEARDOWN:
+                        self.state = self.INIT
+                        self.teardownAcked = 1
+                        print("[CLIENT] Teardown complete")
+        except Exception as e:
+            print(f"[ERROR] Failed to parse RTSP reply: {e}")
 
     # -----------------------------------------------------
 
     def openRtpPort(self):
-        self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rtpSocket.settimeout(0.5)
-        self.rtpSocket.bind(("", self.rtpPort))
+        try:
+            self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.rtpSocket.settimeout(0.5)
+            self.rtpSocket.bind(("", self.rtpPort))
+            print(f"[CLIENT] RTP socket opened on port {self.rtpPort}")
+        except Exception as e:
+            print(f"[ERROR] Failed to open RTP port: {e}")
+            sys.exit(1)
 
     # -----------------------------------------------------
 
