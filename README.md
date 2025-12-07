@@ -32,3 +32,9 @@ python3 Server.py 8554
 - ClientLauncher.py
 ```bash
 python3 ClientLauncher.py localhost 8554 25000 movie.Mjpeg
+
+## Project Version Controll
+GitHub: https://github.com/truongson77/MMT_VideoStreamingSocket2025
+
+## Documents
+Google Drive: https://drive.google.com/drive/folders/1GYhRTEAHrAI24ulYhHkcXFIPZD-0rDLu?usp=share_link
