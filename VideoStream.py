@@ -3,7 +3,6 @@ import cv2
 
 class VideoStream:
     def __init__(self, filename):
-        """Mở file video bằng OpenCV."""
         self.filename = filename
         self.cap = cv2.VideoCapture(self.filename)
 
@@ -22,11 +21,11 @@ class VideoStream:
 
         ret, frame = self.cap.read()
         if not ret:
-            # Hết video
-            return None
+            return None  # Hết video
 
-        # Nén frame thành JPEG (giống file .Mjpeg cũ)
-        success, jpeg = cv2.imencode(".jpg", frame)
+        # JPEG quality cao cho HD
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 98]
+        success, jpeg = cv2.imencode(".jpg", frame, encode_param)
         if not success:
             return None
 
@@ -34,10 +33,8 @@ class VideoStream:
         return jpeg.tobytes()
 
     def frameNbr(self):
-        """Trả về số thứ tự frame hiện tại."""
         return self.frameNum
 
     def __del__(self):
-        """Giải phóng tài nguyên khi đối tượng bị hủy."""
         if hasattr(self, "cap") and self.cap.isOpened():
             self.cap.release()
