@@ -3,17 +3,13 @@ from tkinter import *
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
-from collections import deque
 import time
+import queue
 
 from RtpPacket import RtpPacket
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
-
-# Buffer cho HD video
-BUFFER_SIZE = 90   # tổng số frame có thể cache (~3s nếu ~30fps)
-MIN_BUFFER = 30    # số frame phải có trước khi bắt đầu play (~1s)
 
 
 class Client:
@@ -47,32 +43,33 @@ class Client:
         self.teardownAcked = 0
 
         self.connectToServer()
-
-        # ==== RTP / FRAME STATS ====
+        self.rtpSocket = None
+        
+        # ===== SIMPLE: Dùng queue.Queue thay vì deque =====
+        self.frameBuffer = queue.Queue(maxsize=100)
+        self.MIN_BUFFER = 20
+        self.is_buffering = True
+        
+        # Frame assembly
+        self.currentFrameData = b''
+        self.currentSeqNum = -1
+        
+        # Stats
         self.expectedSeq = None
         self.receivedPackets = 0
         self.lostPackets = 0
-
         self.receivedFrames = 0
         self.totalBytesReceived = 0
-
         self.firstPacketTime = None
         self.lastPacketTime = None
-
         self.lastFrameTime = None
-        self.frameIntervals = []   # dùng để tính jitter
-
-        # Buffer + cache
-        self.frameBuffer = bytearray()
-        self.frameCache = deque(maxlen=BUFFER_SIZE)
-        self.buffering = False
+        self.frameIntervals = []
         
-        # Flag để track trạng thái streaming
-        self.streamEnded = False
+        # FPS tracking
+        self.fpsFrameCount = 0
+        self.fpsStartTime = time.time()
+        self.displayFPS = 0.0
 
-    # -----------------------------------------------------
-    # GUI SETUP
-    # -----------------------------------------------------
     def createWidgets(self):
         self.setup = Button(
             self.master, width=20, padx=3, pady=3,
@@ -103,360 +100,329 @@ class Client:
             row=0, column=0, columnspan=4,
             sticky=W+E+N+S, padx=5, pady=5
         )
-
-    # -----------------------------------------------------
+        
+        # Stats label
+        self.statsLabel = Label(
+            self.master, 
+            text="State: INIT", 
+            font=("Consolas", 10), 
+            anchor=W, 
+            justify=LEFT
+        )
+        self.statsLabel.grid(row=2, column=0, columnspan=4, sticky=W+E, padx=5, pady=2)
 
     def setupMovie(self):
         if self.state == self.INIT:
             self.sendRtspRequest(self.SETUP)
 
     def exitClient(self):
-        # In stats TRƯỚC khi teardown
         if self.state == self.PLAYING or self.receivedPackets > 0:
             self.print_stats()
+        
         self.sendRtspRequest(self.TEARDOWN)
-        # Đợi một chút để đảm bảo TEARDOWN được gửi
         time.sleep(0.1)
         self.master.destroy()
 
     def pauseMovie(self):
         if self.state == self.PLAYING:
             self.sendRtspRequest(self.PAUSE)
-            # Đợi một chút để đảm bảo stats được in đầy đủ
             time.sleep(0.1)
             self.print_stats()
 
     def playMovie(self):
         if self.state == self.READY:
-            print("[CLIENT] PLAY clicked – buffering...")
-
-            # Reset flag nếu replay
-            self.streamEnded = False
-
-            # bắt đầu thread nhận RTP
-            threading.Thread(target=self.listenRtp, daemon=True).start()
-
-            self.playEvent = threading.Event()
-            self.playEvent.clear()
-            self.sendRtspRequest(self.PLAY)
-
-            self.buffering = True
-
-            # thread đợi cho đủ MIN_BUFFER frame rồi mới play cache
-            threading.Thread(target=self.waitForBuffer, daemon=True).start()
-
-    # -----------------------------------------------------
-    # Buffer logic
-    # -----------------------------------------------------
-
-    def waitForBuffer(self):
-        # chờ frame đầu tiên
-        while len(self.frameCache) == 0:
-            if self.state != self.PLAYING or self.streamEnded:
-                return
-
-        # đợi tới khi đủ MIN_BUFFER frame
-        while len(self.frameCache) < MIN_BUFFER and self.state == self.PLAYING:
-            if self.streamEnded:
-                break
-
-        # bắt đầu play từ cache
-        threading.Thread(target=self.playFromCache, daemon=True).start()
-
-    def playFromCache(self):
-        cacheFile = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-        FRAME_INTERVAL = 0.05  # 20 fps = 0.05s per frame
-
-        while len(self.frameCache) > 0 and self.state == self.PLAYING:
-            frameData = self.frameCache.popleft()
-
-            with open(cacheFile, "wb") as f:
-                f.write(frameData)
-
-            try:
-                photo = ImageTk.PhotoImage(Image.open(cacheFile))
-                self.label.configure(image=photo)
-                self.label.image = photo
-            except Exception as e:
-                print(f"[ERROR] Failed to display frame: {e}")
+            print("[CLIENT] PLAY clicked")
             
-            # THÊM DELAY để đồng bộ với server frame rate
-            time.sleep(FRAME_INTERVAL)
-        
-        # Khi cache hết và stream đã kết thúc
-        if self.streamEnded and len(self.frameCache) == 0:
-            print("[CLIENT] Video playback completed")
+            # ===== SIMPLE: Chỉ start RTP listener 1 lần =====
+            if not hasattr(self, 'rtpListenerStarted'):
+                threading.Thread(target=self.listenRtp, daemon=True).start()
+                self.rtpListenerStarted = True
+            
+            self.sendRtspRequest(self.PLAY)
+            self.fpsStartTime = time.time()
+            self.fpsFrameCount = 0
 
-    # -----------------------------------------------------
-    # RTP RECEIVING + FRAME ASSEMBLY
-    # -----------------------------------------------------
+    # ===== KEY: Dùng Tkinter after() thay vì thread riêng =====
+    def consumeBuffer(self):
+        """Được gọi bởi Tkinter event loop - KHÔNG dùng thread riêng"""
+        
+        # Dừng nếu không PLAYING
+        if self.state != self.PLAYING:
+            return
+        
+        if self.requestSent == self.PAUSE:
+            return
+        
+        currentSize = self.frameBuffer.qsize()
+        now = time.time()
+        timeDiff = now - self.fpsStartTime
+        
+        # Update FPS display mỗi giây
+        if timeDiff >= 1.0:
+            self.displayFPS = self.fpsFrameCount / timeDiff
+            self.fpsFrameCount = 0
+            self.fpsStartTime = now
+        
+        # Calculate loss rate
+        lossRate = 0.0
+        totalExpected = self.receivedPackets + self.lostPackets
+        if totalExpected > 0:
+            lossRate = (self.lostPackets / totalExpected) * 100
+        
+        # ===== BUFFERING LOGIC =====
+        if self.is_buffering:
+            if currentSize < self.MIN_BUFFER:
+                percent = int((currentSize / self.MIN_BUFFER) * 100)
+                self.statsLabel.config(text=f"Buffering... {percent}% | Loss: {lossRate:.1f}%")
+                self.master.after(50, self.consumeBuffer)
+                return
+            else:
+                self.is_buffering = False
+        
+        # Buffer underrun
+        if currentSize == 0:
+            self.is_buffering = True
+            self.master.after(20, self.consumeBuffer)
+            return
+        
+        # ===== DISPLAY FRAME =====
+        if not self.frameBuffer.empty():
+            imageFile = self.frameBuffer.get()
+            self.updateMovie(imageFile)
+            self.fpsFrameCount += 1
+            
+            try:
+                os.remove(imageFile)
+            except:
+                pass
+            
+            # Update stats display
+            statText = f"FPS: {self.displayFPS:.1f} | Loss: {lossRate:.2f}% | Buffer: {currentSize}"
+            self.statsLabel.config(text=statText)
+        
+        # ===== ADAPTIVE DELAY =====
+        delay = 50  # Default 20 fps
+        if currentSize > 50:
+            delay = 40  # Speed up if buffer high
+        
+        # ===== KEY: Schedule next frame với Tkinter =====
+        self.master.after(delay, self.consumeBuffer)
 
     def listenRtp(self):
-        print("[CLIENT] Starting RTP listener...")
+        """Thread duy nhất cho RTP - đơn giản và ổn định"""
+        print("[CLIENT] RTP listener started")
         
         while True:
             try:
-                data = self.rtpSocket.recv(65536)
-                if not data:
-                    continue
-
-                # ---- Thống kê byte + thời gian ----
-                now = time.time()
-                packet_len = len(data)
-                self.totalBytesReceived += packet_len
-
-                if self.firstPacketTime is None:
-                    self.firstPacketTime = now
-                self.lastPacketTime = now
-
-                # ====================================
-
-                rtpPacket = RtpPacket()
-                rtpPacket.decode(data)
-
-                seq = rtpPacket.seqNum()
-                marker = rtpPacket.getMarker()
-                payload = rtpPacket.getPayload()
-
-                # In seq number cho debug
-                print(f"[RTP] Seq={seq}, marker={marker}, len={len(payload)} bytes")
-
-                # ---- Packet loss detection ----
-                if self.expectedSeq is None:
-                    self.expectedSeq = seq + 1
-                else:
-                    if seq > self.expectedSeq:
-                        self.lostPackets += (seq - self.expectedSeq)
-                    self.expectedSeq = seq + 1
-
-                self.receivedPackets += 1
-
-                # ---- Ghép fragment ----
-                self.frameBuffer.extend(payload)
-
-                if marker == 1:
-                    # Frame hoàn chỉnh
-                    self.receivedFrames += 1
-
-                    frame_time = now
-                    if self.lastFrameTime is not None:
-                        interval = frame_time - self.lastFrameTime
-                        self.frameIntervals.append(interval)
-                    self.lastFrameTime = frame_time
-
-                    imageFile = self.writeFrame(self.frameBuffer)
-
-                    # CACHE
-                    if self.buffering and len(self.frameCache) < BUFFER_SIZE:
-                        with open(imageFile, "rb") as f:
-                            self.frameCache.append(f.read())
-                            print(f"[CACHE] Stored frame – {len(self.frameCache)}")
-
-                    # LIVE UPDATE (khi cache tiêu hết)
-                    self.updateMovie(imageFile)
-                    self.frameBuffer = bytearray()
-
-            except socket.timeout:
-                # Timeout bình thường, tiếp tục loop
-                if self.state != self.PLAYING:
-                    break
-                continue
-                
-            except OSError as e:
-                # Socket đã đóng hoặc lỗi mạng
-                print(f"[ERROR] Socket error: {e}")
-                break
-                
-            except Exception as e:
-                print(f"[ERROR] Unexpected error in listenRtp: {e}")
-                traceback.print_exc()
-                
-                # Kiểm tra các điều kiện dừng
-                if hasattr(self, "playEvent") and self.playEvent.isSet():
-                    print("[CLIENT] Playback paused by user")
-                    break
-
                 if self.teardownAcked == 1:
-                    print("[CLIENT] Teardown acknowledged, closing...")
-                    self.streamEnded = True
-                    self.print_stats()
-                    try:
-                        self.rtpSocket.close()
-                    except Exception:
-                        pass
                     break
                 
-                # Nếu không phải PAUSE/TEARDOWN, có thể là video kết thúc
-                if self.state == self.PLAYING:
-                    print("[CLIENT] Stream ended unexpectedly")
-                    self.streamEnded = True
-                    self.print_stats()
+                data = self.rtpSocket.recv(40960)
+                
+                if data:
+                    now = time.time()
+                    self.totalBytesReceived += len(data)
+                    
+                    if self.firstPacketTime is None:
+                        self.firstPacketTime = now
+                    self.lastPacketTime = now
+                    
+                    rtpPacket = RtpPacket()
+                    rtpPacket.decode(data)
+                    
+                    receivedSeqNum = rtpPacket.seqNum()
+                    marker = rtpPacket.getMarker()
+                    payload = rtpPacket.getPayload()
+                    
+                    self.receivedPackets += 1
+                    
+                    # ===== Log seq number mỗi 1000 packets =====
+                    if receivedSeqNum % 2000 == 0:
+                        print(f"[RTP] Seq={receivedSeqNum}, marker={marker}")
+                    if marker == 1 and (self.receivedFrames % 20 == 0):
+                        print(f"[RTP] EndFrame at seq={receivedSeqNum} (marker=1)")
+                    # Packet loss detection
+                    if self.currentSeqNum != -1:
+                        diff = receivedSeqNum - self.currentSeqNum
+                        if diff > 1:
+                            self.lostPackets += (diff - 1)
+                            self.currentFrameData = b''  # Reset frame on loss
+                    
+                    self.currentSeqNum = receivedSeqNum
+                    self.currentFrameData += payload
+                    
+                    # Frame complete
+                    if marker == 1:
+                        if len(self.currentFrameData) > 0:
+                            self.receivedFrames += 1
+                            
+                            # Track frame intervals for jitter
+                            frameTime = now
+                            if not self.is_buffering:
+                                if self.lastFrameTime is not None:
+                                    interval = frameTime - self.lastFrameTime
+                                    self.frameIntervals.append(interval)
+                                self.lastFrameTime = frameTime
+                            else:
+                                self.lastFrameTime = None
+                            
+                            # Write frame
+                            path = self.writeFrame(self.currentFrameData, receivedSeqNum)
+                            
+                            # Add to buffer
+                            if not self.frameBuffer.full():
+                                self.frameBuffer.put(path)
+                        
+                        self.currentFrameData = b''
+            
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.teardownAcked == 1:
                     break
-
+                print(f"[RTP ERROR] {e}")
+        
         print("[CLIENT] RTP listener stopped")
 
-    # -----------------------------------------------------
-
-    def writeFrame(self, data):
-        filepath = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
+    def writeFrame(self, data, frameNum):
+        cacheName = CACHE_FILE_NAME + str(self.sessionId) + "_" + str(frameNum) + CACHE_FILE_EXT
         
         try:
-            with open(filepath, "wb") as f:
+            with open(cacheName, "wb") as f:
                 f.write(data)
-                
-            # ===== Lưu thêm một số frame để so sánh =====
+            
+            # Save some frames for comparison
             if self.savedFrameCount < self.MAX_SAVE_FRAMES:
-                frame_num = self.receivedFrames
-                compare_path = f"streamed_frames/frame_{frame_num:04d}.jpg"
-                
-                # Tạo thư mục nếu chưa có
+                comparePath = f"streamed_frames/frame_{self.receivedFrames:04d}.jpg"
                 os.makedirs("streamed_frames", exist_ok=True)
-                
-                with open(compare_path, "wb") as f:
+                with open(comparePath, "wb") as f:
                     f.write(data)
-                
                 self.savedFrameCount += 1
-                print(f"[SAVE] Saved for comparison: {compare_path}")
-            # ==================================================
-        except Exception as e:
-            print(f"[ERROR] Failed to write frame: {e}")
+        except:
+            pass
         
-        return filepath
-    
+        return cacheName
 
     def updateMovie(self, imageFile):
         try:
-            photo = ImageTk.PhotoImage(Image.open(imageFile))
+            image = Image.open(imageFile)
+            photo = ImageTk.PhotoImage(image)
             self.label.configure(image=photo, height=288)
             self.label.image = photo
-        except Exception as e:
-            print(f"[ERROR] Failed to update display: {e}")
-
-    # -----------------------------------------------------
-    # RTSP  
-    # -----------------------------------------------------
+        except:
+            pass
 
     def connectToServer(self):
         try:
             self.rtspSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.rtspSocket.connect((self.serverAddr, self.serverPort))
-            print(f"[CLIENT] Connected to server {self.serverAddr}:{self.serverPort}")
+            print(f"[CLIENT] Connected to {self.serverAddr}:{self.serverPort}")
         except Exception as e:
-            print(f"[ERROR] Failed to connect to server: {e}")
+            print(f"[ERROR] Connection failed: {e}")
             sys.exit(1)
 
     def sendRtspRequest(self, requestCode):
+        request = ""
+        
         if requestCode == self.SETUP and self.state == self.INIT:
             threading.Thread(target=self.recvRtspReply, daemon=True).start()
             self.rtspSeq += 1
-            request = (
-                f"SETUP {self.fileName} RTSP/1.0\n"
-                f"CSeq: {self.rtspSeq}\n"
-                f"Transport: RTP/UDP; client_port= {self.rtpPort}"
-            )
+            request = f"SETUP {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nTransport: RTP/UDP; client_port={self.rtpPort}\n"
             self.requestSent = self.SETUP
-
+        
         elif requestCode == self.PLAY and self.state == self.READY:
             self.rtspSeq += 1
-            request = (
-                f"PLAY {self.fileName} RTSP/1.0\n"
-                f"CSeq: {self.rtspSeq}\n"
-                f"Session: {self.sessionId}"
-            )
+            request = f"PLAY {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
             self.requestSent = self.PLAY
-
+        
         elif requestCode == self.PAUSE and self.state == self.PLAYING:
             self.rtspSeq += 1
-            request = (
-                f"PAUSE {self.fileName} RTSP/1.0\n"
-                f"CSeq: {self.rtspSeq}\n"
-                f"Session: {self.sessionId}"
-            )
+            request = f"PAUSE {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
             self.requestSent = self.PAUSE
-
+        
         elif requestCode == self.TEARDOWN and not self.state == self.INIT:
             self.rtspSeq += 1
-            request = (
-                f"TEARDOWN {self.fileName} RTSP/1.0\n"
-                f"CSeq: {self.rtspSeq}\n"
-                f"Session: {self.sessionId}"
-            )
+            request = f"TEARDOWN {self.fileName} RTSP/1.0\nCSeq: {self.rtspSeq}\nSession: {self.sessionId}\n"
             self.requestSent = self.TEARDOWN
-
+        
         else:
             return
-
+        
         try:
             self.rtspSocket.send(request.encode())
-            print("\nData sent:\n" + request)
+            print(f"\n[CLIENT] Sent:\n{request}")
         except Exception as e:
-            print(f"[ERROR] Failed to send RTSP request: {e}")
-
-    # -----------------------------------------------------
+            print(f"[ERROR] Send failed: {e}")
 
     def recvRtspReply(self):
         while True:
             try:
                 reply = self.rtspSocket.recv(1024)
                 if reply:
-                    self.parseRtspReply(reply.decode("utf-8"))
-
+                    decodedReply = reply.decode("utf-8")
+                    print(f"[CLIENT] Received:\n{decodedReply}")
+                    self.parseRtspReply(decodedReply)
+                
                 if self.requestSent == self.TEARDOWN:
+                    self.rtspSocket.shutdown(socket.SHUT_RDWR)
                     self.rtspSocket.close()
                     break
-            except Exception as e:
-                print(f"[ERROR] Failed to receive RTSP reply: {e}")
+            except:
                 break
-
-    # -----------------------------------------------------
 
     def parseRtspReply(self, data):
         try:
             lines = data.split('\n')
+            if len(lines) < 3:
+                return
+            
+            statusCode = int(lines[0].split(' ')[1])
             seqNum = int(lines[1].split(' ')[1])
-
-            if seqNum == self.rtspSeq:
-                session = int(lines[2].split(' ')[1])
-
+            session = int(lines[2].split(' ')[1])
+            
+            if seqNum == self.rtspSeq and statusCode == 200:
                 if self.sessionId == 0:
                     self.sessionId = session
-
-                if self.sessionId == session and int(lines[0].split(' ')[1]) == 200:
-
+                
+                if self.sessionId == session:
                     if self.requestSent == self.SETUP:
                         self.state = self.READY
                         self.openRtpPort()
-                        print("[CLIENT] Setup complete, ready to play")
-
+                        print("[CLIENT] State -> READY")
+                    
                     elif self.requestSent == self.PLAY:
                         self.state = self.PLAYING
-                        print("[CLIENT] Playing...")
-
+                        self.currentFrameData = b''
+                        self.currentSeqNum = -1
+                        self.is_buffering = True
+                        # ===== KEY: Start consuming với Tkinter =====
+                        self.lastFrameTime = None
+                        self.frameIntervals.clear()
+                        self.consumeBuffer()
+                        print("[CLIENT] State -> PLAYING")
+                    
                     elif self.requestSent == self.PAUSE:
+                        self.lastFrameTime = None
                         self.state = self.READY
-                        self.playEvent.set()
-                        print("[CLIENT] Paused")
-
+                        print("[CLIENT] State -> READY")
+                    
                     elif self.requestSent == self.TEARDOWN:
                         self.state = self.INIT
                         self.teardownAcked = 1
-                        print("[CLIENT] Teardown complete")
+                        print("[CLIENT] State -> INIT")
         except Exception as e:
-            print(f"[ERROR] Failed to parse RTSP reply: {e}")
-
-    # -----------------------------------------------------
+            print(f"[ERROR] Parse reply failed: {e}")
 
     def openRtpPort(self):
         try:
             self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.rtpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
             self.rtpSocket.settimeout(0.5)
-            self.rtpSocket.bind(("", self.rtpPort))
-            print(f"[CLIENT] RTP socket opened on port {self.rtpPort}")
+            self.rtpSocket.bind(('', self.rtpPort))
+            print(f"[CLIENT] RTP socket on port {self.rtpPort}")
         except Exception as e:
             print(f"[ERROR] Failed to open RTP port: {e}")
             sys.exit(1)
-
-    # -----------------------------------------------------
 
     def handler(self):
         self.pauseMovie()
@@ -465,54 +431,37 @@ class Client:
         else:
             self.playMovie()
 
-    # -----------------------------------------------------
-    # FINAL CLIENT STATISTICS
-    # -----------------------------------------------------
-
     def print_stats(self):
         print("\n========== CLIENT STATS ==========")
-
+        
         totalPackets = self.receivedPackets + self.lostPackets
-
-        # Packet loss rate
-        if totalPackets > 0:
-            lossRate = self.lostPackets * 100.0 / totalPackets
-        else:
-            lossRate = 0.0
-
+        lossRate = (self.lostPackets * 100.0 / totalPackets) if totalPackets > 0 else 0.0
+        
         print(f"Received packets     : {self.receivedPackets}")
         print(f"Lost packets         : {self.lostPackets}")
         print(f"Loss rate            : {lossRate:.2f}%")
-
-        # Throughput
+        
         if self.firstPacketTime and self.lastPacketTime:
             duration = max(self.lastPacketTime - self.firstPacketTime, 1e-6)
             throughput = (self.totalBytesReceived * 8) / duration / 1_000_000
         else:
             duration = 0
             throughput = 0
-
+        
         print(f"Duration             : {duration:.2f}s")
         print(f"Throughput           : {throughput:.2f} Mbps")
         print(f"Total bytes received : {self.totalBytesReceived}")
-
-        # Frames received
         print(f"Received frames      : {self.receivedFrames}")
-
-        # FPS thực tế
-        if duration > 0:
-            fps = self.receivedFrames / duration
-        else:
-            fps = 0
+        
+        fps = (self.receivedFrames / duration) if duration > 0 else 0
         print(f"Playback FPS         : {fps:.2f}")
-
-        # Jitter (dựa trên khoảng cách giữa các frame hoàn chỉnh)
+        
         if len(self.frameIntervals) > 1:
             mean = sum(self.frameIntervals) / len(self.frameIntervals)
             variance = sum((x - mean) ** 2 for x in self.frameIntervals) / len(self.frameIntervals)
             jitter_ms = (variance ** 0.5) * 1000
         else:
             jitter_ms = 0
-
+        
         print(f"Jitter (frame)       : {jitter_ms:.2f} ms")
         print("=================================\n")
